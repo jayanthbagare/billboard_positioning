@@ -34,6 +34,13 @@ from collections import deque
 import cv2
 import numpy as np
 
+from bbmp_rules import (
+    BBMPMetadata,
+    apply_bbmp_compliance,
+    compliance_summary,
+    RULE_DESCRIPTIONS,
+)
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CONFIGURATION
@@ -556,23 +563,43 @@ def annotate(frame, surfaces, fidx, motion_state, flow_mag, stop_mult):
 # HTML REPORT  — India edition
 # ─────────────────────────────────────────────────────────────────────────────
 
-def write_report(scored, total_frames, fps, video_name, mode, out_path):
+def write_report(scored, total_frames, fps, video_name, mode, out_path, bbmp_stats=None):
 
     # Stop-zone premium section (surfaces where most dwell was stationary)
     stop_surfaces = [s for s in scored if s["stopped_pct"] > 40]
 
     rows = ""
     for s in scored[:25]:
-        pct  = int(s["composite_score"] * 100)
+        pct  = int(s["final_composite"] * 100)
         col  = "#1B5E20" if pct>65 else "#E65100" if pct>40 else "#B71C1C"
         spct = int(s["stop_zone_score"] * 100)
+        bpct = int(s.get("bbmp_score", 1.0) * 100)
+        bcol = "#1B5E20" if bpct >= 80 else "#E65100" if bpct >= 50 else "#B71C1C"
+        all_flags = s.get("compliance_flags", []) + s.get("compliance_warnings", [])
+        flags_html = ""
+        if all_flags:
+            tier_flag  = s.get("compliance_flags", [])
+            tier_warn  = s.get("compliance_warnings", [])
+            for f in tier_flag:
+                short = f.split("_", 1)[0]
+                flags_html += (f'<span style="background:#B71C1C;color:#fff;'
+                               f'padding:1px 5px;border-radius:3px;font-size:10px;'
+                               f'margin-right:2px">{short}</span>')
+            for f in tier_warn:
+                short = f.split("_", 1)[0]
+                flags_html += (f'<span style="background:#E65100;color:#fff;'
+                               f'padding:1px 5px;border-radius:3px;font-size:10px;'
+                               f'margin-right:2px">~{short}</span>')
+        else:
+            flags_html = '<span style="color:#1B5E20;font-size:11px">✓</span>'
         rows += f"""<tr>
           <td><b>#{s['rank']}</b></td>
           <td>{s['surface_id']}</td>
           <td>
             <div style="background:#eee;border-radius:3px;height:13px;width:90px;display:inline-block">
               <div style="background:{col};width:{pct}%;height:100%;border-radius:3px"></div>
-            </div>&nbsp;{s['composite_score']:.3f}
+            </div>&nbsp;{s['final_composite']:.3f}
+            <br><small style="color:#aaa">raw:{s['composite_score']:.3f}</small>
           </td>
           <td>{s['dwell_score']:.3f}<br><small style="color:#999">wt:{s['weighted_dwell']:.0f}</small></td>
           <td>{s['saliency_score']:.3f}</td>
@@ -585,26 +612,47 @@ def write_report(scored, total_frames, fps, video_name, mode, out_path):
           <td>{s['lht_weight']:.2f}</td>
           <td>{s['position']}</td>
           <td>{s['distance']}</td>
-          <td style="color:{col};font-weight:600">{s['quality']}</td>
-          <td style="font-size:12px;color:#555">{s['recommendation']}</td>
+          <td style="color:{col};font-weight:600">{s['final_quality']}</td>
+          <td>
+            <div style="background:#eee;border-radius:3px;height:8px;width:50px;display:inline-block;vertical-align:middle">
+              <div style="background:{bcol};width:{bpct}%;height:100%;border-radius:3px"></div>
+            </div>&nbsp;<span style="font-size:11px;color:{bcol}">{s.get('bbmp_score',1.0):.2f}</span>
+            <br>{flags_html}
+          </td>
         </tr>"""
 
     medals = ["🥇", "🥈", "🥉"]
     top3 = ""
     for i, s in enumerate(scored[:3]):
-        pct  = int(s["composite_score"]*100)
+        pct  = int(s["final_composite"]*100)
         spct = int(s["stop_zone_score"]*100)
         stop_badge = ""
         if s["stopped_pct"] > 40:
             stop_badge = (f'<span style="background:#FF6F00;color:#fff;padding:2px 8px;'
                           f'border-radius:10px;font-size:11px;margin-left:8px">🛑 SIGNAL STOP ZONE</span>')
+        # BBMP compliance badge
+        all_flags = s.get("compliance_flags", []) + s.get("compliance_warnings", [])
+        if not all_flags:
+            bbmp_badge = ('<span style="background:#1B5E20;color:#fff;padding:2px 8px;'
+                         'border-radius:10px;font-size:11px;margin-left:8px">✓ BBMP</span>')
+        elif s.get("compliance_flags"):
+            bbmp_badge = ('<span style="background:#B71C1C;color:#fff;padding:2px 8px;'
+                         'border-radius:10px;font-size:11px;margin-left:8px">✗ BBMP FLAG</span>')
+        else:
+            bbmp_badge = ('<span style="background:#E65100;color:#fff;padding:2px 8px;'
+                         'border-radius:10px;font-size:11px;margin-left:8px">⚠ BBMP WARN</span>')
+        score_color = "#1B5E20" if pct > 65 else "#E65100" if pct > 40 else "#B71C1C"
         top3 += f"""
         <div style="background:#fff;border-left:5px solid #1B4F8A;border-radius:8px;
              padding:18px 22px;margin-bottom:14px;box-shadow:0 2px 8px rgba(0,0,0,0.09)">
           <div style="font-size:18px;font-weight:700;color:#1B4F8A">
-            {medals[i]} {s['surface_id']}{stop_badge}
+            {medals[i]} {s['surface_id']}{stop_badge}{bbmp_badge}
           </div>
-          <div style="font-size:32px;font-weight:800;color:#1B5E20;line-height:1.2">{pct}%</div>
+          <div style="font-size:32px;font-weight:800;color:{score_color};line-height:1.2">{pct}%
+            <span style="font-size:14px;font-weight:400;color:#aaa">final</span>
+            &nbsp;<span style="font-size:18px;color:#aaa">{int(s['composite_score']*100)}%
+              <span style="font-size:11px">raw</span></span>
+          </div>
           <div style="color:#555;margin:4px 0 10px">{s['recommendation']}</div>
           <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));
                gap:10px;font-size:13px">
@@ -629,12 +677,57 @@ def write_report(scored, total_frames, fps, video_name, mode, out_path):
               <div style="color:#999;font-size:11px">LHT weight</div>
               <div style="font-weight:700;color:#333">{s['lht_weight']:.2f}×</div>
             </div>
-            <div style="background:#F3F4F6;border-radius:6px;padding:8px 10px">
-              <div style="color:#999;font-size:11px">Frames visible</div>
-              <div style="font-weight:700;color:#333">{s['frame_count']}
-                <span style="font-weight:400;color:#777">({s['first_frame']}–{s['last_frame']})</span></div>
+            <div style="background:#{'EBF5EB' if not all_flags else 'FFF3E0' if not s.get('compliance_flags') else 'FEEBEE'};border-radius:6px;padding:8px 10px">
+              <div style="color:#999;font-size:11px">BBMP score</div>
+              <div style="font-weight:700;color:{'#1B5E20' if not all_flags else '#E65100' if not s.get('compliance_flags') else '#B71C1C'}">{s.get('bbmp_score',1.0):.3f}</div>
             </div>
           </div>
+        </div>"""
+
+    # BBMP compliance section
+    bbmp_section = ""
+    if bbmp_stats:
+        tier_label = "Video + Metadata" if bbmp_stats.get("tier") == "metadata_checked" else "Video only (Tier 1)"
+        rc = bbmp_stats.get("rule_counts", {})
+        rule_rows = ""
+        for code, cnt in sorted(rc.items(), key=lambda x: -x[1]):
+            desc  = RULE_DESCRIPTIONS.get(code, code)
+            is_t2 = code not in {"R7_junction_setback","R12_footpath_placement",
+                                  "R13_road_projection","R14_vertical_stacking"}
+            badge = ('<span style="background:#B71C1C;color:#fff;padding:1px 6px;'
+                     'border-radius:4px;font-size:10px">CONFIRMED</span>'
+                     if is_t2 else
+                     '<span style="background:#E65100;color:#fff;padding:1px 6px;'
+                     'border-radius:4px;font-size:10px">INFERRED</span>')
+            rule_rows += f"""<tr>
+              <td style="font-family:monospace;font-size:12px">{code.split('_',1)[0]}</td>
+              <td>{desc}&nbsp;{badge}</td>
+              <td style="text-align:center;font-weight:700">{cnt}</td>
+            </tr>"""
+        if not rule_rows:
+            rule_rows = '<tr><td colspan="3" style="color:#1B5E20;text-align:center">No compliance issues detected</td></tr>'
+        bbmp_section = f"""
+        <div class="sec">
+          <h2>🏛 BBMP / GBA Compliance Summary</h2>
+          <div style="display:flex;gap:12px;margin-bottom:16px;flex-wrap:wrap">
+            <div class="card" style="border-top:3px solid #1B5E20">
+              <div class="v" style="color:#1B5E20">{bbmp_stats.get('eligible',0)}</div>
+              <div class="l">Eligible surfaces</div></div>
+            <div class="card" style="border-top:3px solid #B71C1C">
+              <div class="v" style="color:#B71C1C">{bbmp_stats.get('flagged',0)}</div>
+              <div class="l">Flagged surfaces</div></div>
+            <div class="card">
+              <div class="v">{tier_label}</div>
+              <div class="l">Compliance tier</div></div>
+          </div>
+          <table style="margin-bottom:8px"><thead><tr>
+            <th style="width:110px">Rule</th><th>Description</th><th style="width:70px">Surfaces</th>
+          </tr></thead><tbody>{rule_rows}</tbody></table>
+          <p style="font-size:11px;color:#888;margin-top:6px">
+            <b>CONFIRMED</b> — from supplied location metadata (Tier 2, higher confidence).&nbsp;
+            <b>INFERRED</b> — derived from video analysis alone (Tier 1, lower confidence).&nbsp;
+            Penalties are soft: non-compliant surfaces remain visible with a reduced final score.
+          </p>
         </div>"""
 
     # Stop-zone premium section
@@ -717,9 +810,14 @@ tr:last-child td{{border:none}} tr:hover td{{background:#F0F7FF}}
       <div class="l">Stop-zone surfaces</div></div>
     <div class="card"><div class="v">{mode.title()}</div>
       <div class="l">Viewer mode</div></div>
+    <div class="card" style="border-top:3px solid #1B5E20">
+      <div class="v" style="color:#1B5E20">{bbmp_stats.get('eligible', len(scored)) if bbmp_stats else len(scored)}</div>
+      <div class="l">BBMP Eligible</div></div>
   </div>
 
   <div class="sec"><h2>Top 3 Recommended Locations</h2>{top3}</div>
+
+  {bbmp_section}
 
   {stop_section}
 
@@ -728,7 +826,7 @@ tr:last-child td{{border:none}} tr:hover td{{background:#F0F7FF}}
     <table><thead><tr>
       <th>Rank</th><th>ID</th><th>Score</th><th>Dwell</th><th>Saliency</th>
       <th>Stop-zone</th><th>Stopped%</th><th>LHT×</th>
-      <th>Position</th><th>Distance</th><th>Quality</th><th>Notes</th>
+      <th>Position</th><th>Distance</th><th>Quality</th><th>BBMP</th>
     </tr></thead><tbody>{rows}</tbody></table>
   </div>
 
@@ -761,7 +859,7 @@ tr:last-child td{{border:none}} tr:hover td{{background:#F0F7FF}}
 # ─────────────────────────────────────────────────────────────────────────────
 
 def run(video_path, fps=4.0, mode="driver", top_n=10,
-        save_frames=True, output_dir=None):
+        save_frames=True, output_dir=None, bbmp_meta=None):
 
     vp  = Path(video_path)
     if not vp.exists():
@@ -853,6 +951,14 @@ def run(video_path, fps=4.0, mode="driver", top_n=10,
         print("No surfaces detected. Try --fps 4 or check video path.")
         sys.exit(0)
 
+    # Apply BBMP / GBA compliance layer
+    scored = apply_bbmp_compliance(scored, bbmp_meta)
+    bbmp_stats = compliance_summary(scored)
+
+    tier_label = bbmp_stats.get("tier", "video_only")
+    print(f"  BBMP compliance ({tier_label}): "
+          f"{bbmp_stats.get('eligible',0)}/{bbmp_stats.get('total_surfaces',0)} eligible\n")
+
     result = {
         "video":            str(vp),
         "mode":             mode,
@@ -860,11 +966,12 @@ def run(video_path, fps=4.0, mode="driver", top_n=10,
         "frames_processed": pi,
         "fps_used":         fps,
         "motion_summary":   state_counts,
+        "bbmp_compliance":  bbmp_stats,
         "surfaces":         scored,
     }
     with open(out / "ranked_surfaces.json", "w") as f:
         json.dump(result, f, indent=2)
-    write_report(scored, pi, fps, vp.name, mode, str(out / "report.html"))
+    write_report(scored, pi, fps, vp.name, mode, str(out / "report.html"), bbmp_stats)
 
     # Print summary
     stop_count = sum(1 for s in scored if s["stopped_pct"] > 40)
@@ -872,11 +979,18 @@ def run(video_path, fps=4.0, mode="driver", top_n=10,
     print(f"  TOP {min(top_n, len(scored))}  ({mode.upper()} MODE — INDIA LHT)")
     print(f"{'─'*60}")
     for s in scored[:top_n]:
-        bar    = "█" * int(s["composite_score"] * 24)
+        bar    = "█" * int(s["final_composite"] * 24)
         stop_f = "🛑" if s["stopped_pct"] > 40 else "  "
+        all_flags = s.get("compliance_flags", []) + s.get("compliance_warnings", [])
+        bbmp_f = ""
+        if s.get("compliance_flags"):
+            bbmp_f = f"  [✗ {','.join(s['compliance_flags'])}]"
+        elif s.get("compliance_warnings"):
+            bbmp_f = f"  [⚠ {','.join(s['compliance_warnings'])}]"
         print(f"  {stop_f} #{s['rank']:2d}  {s['surface_id']}  "
-              f"{bar:<24}  {s['composite_score']:.3f}  "
-              f"{s['recommendation']}")
+              f"{bar:<24}  {s['final_composite']:.3f}"
+              f" (raw:{s['composite_score']:.3f})"
+              f"  {s['final_quality']}{bbmp_f}")
 
     print(f"\n  🛑 Stop-zone premium surfaces: {stop_count}")
     print(f"\n{'='*60}")
@@ -902,6 +1016,28 @@ if __name__ == "__main__":
                     help="Skip saving annotated frames")
     ap.add_argument("--output",    default=None,
                     help="Output directory")
+    # ── BBMP / GBA compliance metadata (all optional) ─────────────────────────
+    ap.add_argument("--road-width-meters",    type=float, default=None,
+                    help="Carriageway width in metres (enables R1 road-width check)")
+    ap.add_argument("--road-name",            type=str,   default=None,
+                    help="Road name for heritage corridor check (R19)")
+    ap.add_argument("--road-type",
+                    choices=["normal", "flyover", "railway", "sharp_curve"],
+                    default="normal",
+                    help="Road type — flyover/railway/sharp_curve trigger absolute prohibitions")
+    ap.add_argument("--nearest-hoarding-m",   type=float, default=None,
+                    help="Distance in metres to nearest existing hoarding (R6 spacing check)")
+    ap.add_argument("--nearest-religious-site-m", type=float, default=None,
+                    help="Distance in metres to nearest religious institution (R8)")
     args = ap.parse_args()
+
+    bbmp_meta = BBMPMetadata(
+        road_width_meters          = args.road_width_meters,
+        road_name                  = args.road_name,
+        road_type                  = args.road_type,
+        nearest_hoarding_m         = args.nearest_hoarding_m,
+        nearest_religious_site_m   = args.nearest_religious_site_m,
+    )
+
     run(args.video, args.fps, args.mode, args.top,
-        not args.no_frames, args.output)
+        not args.no_frames, args.output, bbmp_meta)

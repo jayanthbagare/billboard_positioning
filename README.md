@@ -2,6 +2,8 @@
 
 A computer-vision pipeline that analyzes dashcam or walkcam footage to rank outdoor advertising surfaces (billboards, wall hoardings, compound-wall ads, flex banners) by their actual attention value for a driver or pedestrian. Built specifically for **Indian urban roads**: left-hand traffic (LHT), right-hand drive, mixed traffic, signal junctions, and the wide variety of Indian OOH (out-of-home) advertising geometry.
 
+A second layer applies **BBMP / GBA outdoor advertising compliance rules** (Bye-Laws 2024, Draft Rules 2025) as soft penalties on top of the attention score, so every surface is ranked by its *effective* value — high attention *and* regulatory clearance.
+
 ---
 
 ## Table of Contents
@@ -20,15 +22,21 @@ A computer-vision pipeline that analyzes dashcam or walkcam footage to rank outd
    - [Composite Scoring](#composite-scoring)
    - [LHT Position Weight](#lht-position-weight)
    - [Stop-Zone Score](#stop-zone-score)
-   - [Distance Bonus/Penalty](#distancebonuspenalty)
+   - [Distance Bonus/Penalty](#distance-bonuspenalty)
    - [Junction / Cognitive Load Penalty](#junction--cognitive-load-penalty)
    - [Final Composite Clamp & Quality Thresholds](#final-composite-clamp--quality-thresholds)
-5. [Configuration Reference](#configuration-reference)
-6. [Outputs](#outputs)
-7. [Installation](#installation)
-8. [Usage](#usage)
-9. [Output Directory Structure](#output-directory-structure)
-10. [Design Decisions & Tuning Notes](#design-decisions--tuning-notes)
+5. [BBMP / GBA Compliance Layer](#bbmp--gba-compliance-layer)
+   - [Legal Context](#legal-context)
+   - [Two-Tier Architecture](#two-tier-architecture)
+   - [Rule Catalogue](#rule-catalogue)
+   - [Penalty Formula & Blending](#penalty-formula--blending)
+   - [Compliance Output Fields](#compliance-output-fields)
+6. [Configuration Reference](#configuration-reference)
+7. [Outputs](#outputs)
+8. [Installation](#installation)
+9. [Usage](#usage)
+10. [Output Directory Structure](#output-directory-structure)
+11. [Design Decisions & Tuning Notes](#design-decisions--tuning-notes)
 
 ---
 
@@ -46,6 +54,7 @@ Existing billboard-scoring tools are calibrated for Western road conditions: rig
 | Junction complexity | Moderate | Very high |
 | Ad surface geometry | Tall vertical billboards | Wide wall hoardings, compound walls, flex banners |
 | Dominant ad colours | Variable | Saffron, red, green dominant |
+| Regulatory framework | N/A | BBMP Bye-Laws 2024 / GBA Draft Rules 2025 |
 
 This tool corrects for all of these factors with explicit math described below.
 
@@ -61,6 +70,7 @@ This tool corrects for all of these factors with explicit math described below.
 | **Wall hoarding geometry** | Aspect ratio bounds tuned: allows up to **14:1** width:height ratio to capture long compound-wall and building-face ads |
 | **Stop-zone tagging** | Each track reports the fraction of its dwell time where the vehicle was stationary. A dedicated "Stop-Zone Premium Surfaces" section in the HTML report surfaces these |
 | **Warm colour bonus** | Saliency formula includes a bonus for saffron (H 10–25°), red (H 0–10° and 170–180°), which are dominant Indian OOH colours |
+| **BBMP / GBA compliance** | 10 rules from BBMP Bye-Laws 2024 and GBA Draft Rules 2025 applied as soft score penalties. Surfaces are re-ranked by `final_composite` (attention × compliance) |
 
 ---
 
@@ -90,6 +100,12 @@ Tracker.update(frame_idx, detections, motion_state, stop_mult, flow_mag)
     ▼
 score_tracks(finished_tracks, total_frames, mode)
     └─► dwell · saliency · size · stop_zone · LHT weight · distance · junction penalty
+    │                                      → composite_score  [0, 1]
+    ▼
+apply_bbmp_compliance(scored_surfaces, BBMPMetadata)
+    ├─► Tier 1: video-derived rule checks (footpath, junction, stacking, projection)
+    └─► Tier 2: metadata rule checks (road width, heritage corridor, spacing, buffers)
+                                       → bbmp_score + final_composite  [0, 1]
     │
     ▼
 Outputs: ranked_surfaces.json  |  report.html  |  annotated_frames/
@@ -499,13 +515,135 @@ quality = "Excellent"  if composite > 0.65
         = "Poor"       otherwise
 ```
 
+This `composite_score` represents pure attention value, before compliance adjustment. The `final_composite` (see next section) is the ranking-ready score that accounts for both attention and BBMP / GBA compliance.
+
+---
+
+## BBMP / GBA Compliance Layer
+
+### Legal Context
+
+Outdoor advertising in Greater Bengaluru is governed by two instruments:
+
+- **BBMP Advertisement Bye-Laws, 2024** — notified July 2025 under the Greater Bengaluru Governance Act 2024. Replaces the 2006 and 2018 bye-laws.
+- **Greater Bengaluru Area (Advertisement) Draft Rules, 2025** — published by the Karnataka Urban Development Department. Introduces zone-based auctions, DOOH norms, and tighter proximity rules.
+
+These rules are implemented in `bbmp_rules.py` and applied automatically after attention scoring. Violations reduce the `final_composite` score but do not remove surfaces from results — planners need to see *why* a surface scores poorly, not have it silently dropped.
+
+---
+
+### Two-Tier Architecture
+
+Rules are split by the quality of evidence available:
+
+```
+Tier 1 — Video-derived (always runs)
+│  Evidence: surface fields already produced by the scoring pipeline
+│  Confidence: lower — inferences from geometry and motion patterns
+│  Output stored as: compliance_warnings
+│
+│  R7  — Junction setback (inferred from stopped_pct)
+│  R12 — Footpath placement (inferred from vertical zone)
+│  R13 — Road projection (inferred from position + area)
+│  R14 — Vertical stacking (cross-surface frame-window check)
+
+Tier 2 — Metadata-assisted (runs when --road-* flags are supplied)
+│  Evidence: explicit location data provided by the user
+│  Confidence: higher — confirmed from known facts about the road
+│  Output stored as: compliance_flags
+│
+│  R1  — Road width below 18 m
+│  R6  — Hoarding spacing below 175 m
+│  R8  — Religious institution buffer
+│  R10 — Flyover / railway proximity
+│  R11 — Sharp curve
+│  R19 — Named heritage corridor
+```
+
+A surface is marked `bbmp_eligible = False` only when Tier 2 flags are present. Tier 1 warnings alone reduce the score but keep `bbmp_eligible = True`, reflecting that the video evidence is inferential.
+
+---
+
+### Rule Catalogue
+
+| ID | Rule | Source | Threshold | Penalty | Tier |
+|---|---|---|---|---|---|
+| R1 | Road width below minimum | BBMP 2024 | < 18 m | 0.30 | 2 |
+| R6 | Inter-hoarding spacing | BBMP 2024 | < 175 m | 0.20 | 2 |
+| R7 | Junction / circle setback | BBMP 2006 | inferred: stopped_pct ≥ 60% | 0.20 | 1 |
+| R8 | Religious institution buffer | GBA 2025 | < 25 m (site) / < 100 m (access road) | 0.25 | 2 |
+| R10 | Flyover / railway proximity | GBA 2025 | road_type = flyover or railway | 0.40 | 2 |
+| R11 | Sharp curve | GBA 2025 | road_type = sharp_curve | 0.25 | 2 |
+| R12 | Footpath placement | BBMP 2024 | inferred: vertical = "lower" | 0.40 | 1 |
+| R13 | Road projection | BBMP 2024 | inferred: centre + mean_area > 0.04 | 0.40 | 1 |
+| R14 | Vertical stacking | BBMP 2024 | inferred: two surfaces, same position/distance, different vertical, overlapping frames | 0.35 | 1 |
+| R19 | Heritage / protected corridor | GBA 2025 | road_name matches named list | 0.45 | 2 |
+
+**Named heritage corridors where third-party ads are absolutely prohibited (GBA 2025):**
+Kumara Krupa Road · Sankey Road · Ambedkar Veedhi · Palace Road · Cubbon Park · Lalbagh · Nrupathunga Road · Maharani College Road
+
+---
+
+### Penalty Formula & Blending
+
+Each triggered rule contributes its penalty to an aggregate:
+
+```
+bbmp_score = max(0.0,  1.0 − Σ RULE_PENALTIES[rule]  for all triggered rules)
+```
+
+The `bbmp_score` is blended with the attention `composite_score` using a fixed weight:
+
+```
+final_composite = composite_score × (1 − BBMP_BLEND_WEIGHT × (1 − bbmp_score))
+
+where BBMP_BLEND_WEIGHT = 0.35
+```
+
+This means:
+
+| `bbmp_score` | Compliance state | Effect on `final_composite` |
+|---|---|---|
+| 1.00 | Fully compliant | No change — `final_composite = composite_score` |
+| 0.80 | One medium penalty (e.g. R6) | −7% of composite |
+| 0.50 | Two medium penalties | −17.5% of composite |
+| 0.00 | All rules violated | −35% of composite (maximum drag) |
+
+The 35% cap means a fully non-compliant but highly visible surface (composite = 0.80) scores `final_composite = 0.52` — still ranked above a compliant but low-attention surface. Compliance modulates the ranking; it does not override visibility.
+
+`final_quality` uses the same thresholds as `quality` but applied to `final_composite`:
+```
+final_quality = "Excellent"  if final_composite > 0.65
+              = "Good"       if final_composite > 0.45
+              = "Fair"       if final_composite > 0.28
+              = "Poor"       otherwise
+```
+
+---
+
+### Compliance Output Fields
+
+Every scored surface gains these additional fields after the compliance layer runs:
+
+| Field | Type | Description |
+|---|---|---|
+| `bbmp_score` | float [0, 1] | Compliance score. 1.0 = no violations |
+| `bbmp_eligible` | bool | `False` only when Tier 2 (metadata) flags are present |
+| `compliance_flags` | list[str] | Tier 2 confirmed violations (from metadata) |
+| `compliance_warnings` | list[str] | Tier 1 inferred violations (from video) |
+| `compliance_tier` | str | `"video_only"` or `"metadata_checked"` |
+| `final_composite` | float [0, 1] | Attention score penalised by BBMP compliance |
+| `final_quality` | str | `Excellent / Good / Fair / Poor` based on `final_composite` |
+
+Surfaces are re-ranked by `final_composite`. The original `composite_score` and `quality` fields are preserved for reference.
+
 ---
 
 ## Configuration Reference
 
-All tunable constants are at the top of `analyze.py`:
+All tunable constants are at the top of their respective files.
 
-### Geometry
+### Geometry (`analyze.py`)
 
 | Constant | Value | Meaning |
 |---|---|---|
@@ -517,7 +655,7 @@ All tunable constants are at the top of `analyze.py`:
 | `MAX_ASPECT` | 14.0 | Maximum width:height ratio (for wide wall hoardings) |
 | `MIN_ASPECT` | 0.10 | Minimum width:height ratio (for tall narrow signs) |
 
-### Tracking
+### Tracking (`analyze.py`)
 
 | Constant | Value | Meaning |
 |---|---|---|
@@ -525,7 +663,7 @@ All tunable constants are at the top of `analyze.py`:
 | `MAX_GAP` | 6 | Max consecutive missed frames before track retirement |
 | `MIN_FRAMES` | 3 | Minimum observation frames for a track to be scored |
 
-### LHT Position Weights
+### LHT Position Weights (`analyze.py`)
 
 | Position | Weight | Meaning |
 |---|---|---|
@@ -533,7 +671,7 @@ All tunable constants are at the top of `analyze.py`:
 | `centre` | 1.00 | Baseline |
 | `right` | 0.82 | Far side (median, dividers, oncoming) |
 
-### Motion State Thresholds
+### Motion State Thresholds (`analyze.py`)
 
 | Constant | Value | Meaning |
 |---|---|---|
@@ -541,7 +679,7 @@ All tunable constants are at the top of `analyze.py`:
 | `FLOW_SLOW` | 6.0 | Flow below which vehicle is in slow crawl |
 | `FLOW_MOVING` | 20.0 | Flow above which junction penalty begins |
 
-### Dwell Multipliers
+### Dwell Multipliers (`analyze.py`)
 
 | State | Multiplier | Meaning |
 |---|---|---|
@@ -549,7 +687,7 @@ All tunable constants are at the top of `analyze.py`:
 | Slow | 1.6 | Crawling traffic — gaze available for periphery |
 | Moving | 1.0 | Normal driving baseline |
 
-### Scoring Weights
+### Scoring Weights (`analyze.py`)
 
 #### Driver Mode
 ```
@@ -561,11 +699,22 @@ dwell=0.50, saliency=0.25, size=0.15, stop_zone=0.10
 dwell=0.35, saliency=0.40, size=0.15, stop_zone=0.10
 ```
 
-### Other
+### Other (`analyze.py`)
 
 | Constant | Value | Meaning |
 |---|---|---|
 | `JUNCTION_PENALTY` | 0.22 | Max composite score deduction at high-flow frames |
+
+### BBMP Compliance Constants (`bbmp_rules.py`)
+
+| Constant | Value | Meaning |
+|---|---|---|
+| `BBMP_BLEND_WEIGHT` | 0.35 | Maximum fraction by which compliance can drag `composite_score` |
+| `MIN_ROAD_WIDTH_M` | 18.0 | Minimum carriageway width in metres (R1) |
+| `MIN_HOARDING_SPACING_M` | 175.0 | Minimum inter-hoarding spacing in metres (R6) |
+| `JUNCTION_STOPPED_PCT_THRESHOLD` | 60.0 | stopped_pct above which junction proximity is inferred (R7) |
+| `RELIGIOUS_SITE_BUFFER_M` | 25.0 | Minimum distance from religious institution in metres (R8) |
+| `RELIGIOUS_ACCESS_BUFFER_M` | 100.0 | Minimum distance from religious institution access road in metres (R9) |
 
 ---
 
@@ -573,7 +722,7 @@ dwell=0.35, saliency=0.40, size=0.15, stop_zone=0.10
 
 ### `ranked_surfaces.json`
 
-JSON file containing:
+JSON file containing video metadata, motion summary, BBMP compliance stats, and the full ranked surface list:
 
 ```json
 {
@@ -583,6 +732,17 @@ JSON file containing:
   "frames_processed": 847,
   "fps_used": 4.0,
   "motion_summary": {"stopped": 120, "slow": 210, "moving": 517},
+  "bbmp_compliance": {
+    "total_surfaces": 12,
+    "eligible": 9,
+    "flagged": 3,
+    "rule_counts": {
+      "R7_junction_setback": 4,
+      "R19_heritage_corridor": 2,
+      "R12_footpath_placement": 1
+    },
+    "tier": "metadata_checked"
+  },
   "surfaces": [
     {
       "surface_id": "S007",
@@ -606,7 +766,14 @@ JSON file containing:
       "aspect_ratio": 3.40,
       "mean_area": 0.00821,
       "quality": "Excellent",
-      "recommendation": "Excellent — left side, mid range, signal/junction stop"
+      "recommendation": "Excellent — left side, mid range, signal/junction stop",
+      "bbmp_score": 0.800,
+      "bbmp_eligible": true,
+      "compliance_flags": [],
+      "compliance_warnings": ["R7_junction_setback"],
+      "compliance_tier": "metadata_checked",
+      "final_composite": 0.694,
+      "final_quality": "Good"
     },
     ...
   ]
@@ -616,10 +783,11 @@ JSON file containing:
 ### `report.html`
 
 Self-contained HTML report with:
-- Summary cards (surfaces ranked, frames analysed, top score, stop-zone count)
-- **Top 3 Recommended Locations** with per-score breakdowns
+- **Summary cards**: surfaces ranked, frames analysed, top score, stop-zone count, BBMP eligible count
+- **Top 3 Recommended Locations** with per-score breakdowns and BBMP compliance badge (`✓ BBMP` / `⚠ BBMP WARN` / `✗ BBMP FLAG`)
+- **BBMP / GBA Compliance Summary** section — eligible vs flagged count, tier, rule-by-rule breakdown table distinguishing CONFIRMED (Tier 2) from INFERRED (Tier 1) violations
 - **Stop-Zone Premium Surfaces** table (surfaces with >40% stopped dwell)
-- Full ranked table for top 25 surfaces
+- **Full ranked table** (top 25) — `final_composite` as primary score, raw `composite_score` shown inline, BBMP score bar and flag codes in the last column
 - Methodology explanation panel
 
 ### `annotated_frames/`
@@ -644,11 +812,13 @@ Python 3.8+ required. No GPU required — all processing runs on CPU via OpenCV.
 
 ## Usage
 
+### Basic
+
 ```bash
-# Basic driver-mode analysis (recommended for dashcam footage)
+# Driver-mode analysis (recommended for dashcam footage)
 python analyze.py --video mumbai.mp4 --fps 4 --mode driver
 
-# Show top 15 surfaces instead of default 10
+# Show top 15 surfaces
 python analyze.py --video bangalore.mp4 --fps 4 --mode driver --top 15
 
 # Pedestrian / walkcam mode
@@ -658,7 +828,32 @@ python analyze.py --video walk.mp4 --fps 3 --mode pedestrian
 python analyze.py --video video.mp4 --fps 4 --mode driver --output ./results --no-frames
 ```
 
+### With BBMP Compliance Metadata
+
+Supply any combination of the `--road-*` flags to activate Tier 2 rules. Flags you omit are simply skipped — partial metadata is safe.
+
+```bash
+# Road width check only (R1)
+python analyze.py --video mg_road.mp4 --fps 4 --road-width-meters 24
+
+# Heritage corridor check (R19) — all surfaces on Sankey Road flagged
+python analyze.py --video sankey.mp4 --fps 4 --road-name "Sankey Road"
+
+# Flyover — absolute prohibition (R10)
+python analyze.py --video flyover.mp4 --fps 4 --road-type flyover
+
+# Full metadata check
+python analyze.py --video residency_road.mp4 --fps 4 \
+  --road-width-meters 30 \
+  --road-name "Residency Road" \
+  --road-type normal \
+  --nearest-hoarding-m 120 \
+  --nearest-religious-site-m 40
+```
+
 ### CLI Arguments
+
+#### Core
 
 | Argument | Default | Description |
 |---|---|---|
@@ -668,6 +863,16 @@ python analyze.py --video video.mp4 --fps 4 --mode driver --output ./results --n
 | `--top` | 10 | Number of top surfaces to print in terminal summary |
 | `--no-frames` | false | Skip saving annotated frame JPEGs (speeds up processing) |
 | `--output` | `billboard_output/<video_stem>/` | Output directory |
+
+#### BBMP / GBA Compliance (all optional)
+
+| Argument | Type | Rule | Description |
+|---|---|---|---|
+| `--road-width-meters` | float | R1 | Carriageway width in metres. Values < 18 m trigger the road-width violation |
+| `--road-name` | string | R19 | Road name checked against the heritage corridor list (case-insensitive substring match) |
+| `--road-type` | enum | R10, R11 | `normal` (default) · `flyover` · `railway` · `sharp_curve` |
+| `--nearest-hoarding-m` | float | R6 | Distance in metres to the nearest existing permitted hoarding |
+| `--nearest-religious-site-m` | float | R8 | Distance in metres to the nearest religious institution |
 
 ### Sampling Rate Selection
 
@@ -725,3 +930,11 @@ Analysis of Indian OOH advertising shows that saffron (Pantone 1505), vermillion
 ### Why stop-zone weighting matters more in India than in the West
 
 In a typical Western city, a driver might stop at a signal for 30–60 seconds per kilometre of driving. In Mumbai, Bengaluru, or Delhi, a driver can spend 3–8 minutes per kilometre stopped at signals, railway crossings, and uncontrolled intersections. This means the dwell time at stop zones is not a minor bonus — it is the dominant factor in actual advertising exposure. The 3× multiplier reflects this structural difference.
+
+### Why soft penalties for BBMP rules instead of hard filters?
+
+BBMP violations reduce `final_composite` by up to 35% but never remove a surface from results. This is deliberate: the tool is an *analysis instrument*, not a permit application checker. A media planner needs to see that S003 scores well on attention but poorly on compliance — and understand why — before deciding whether to pursue a variance, target a different surface, or accept the risk. Hard filtering would hide that information. If you want a filtered shortlist for permit submission, post-process the JSON output on `bbmp_eligible == true`.
+
+### Why separate `bbmp_rules.py` instead of adding to `analyze.py`?
+
+Compliance rules change — new BBMP amendments, GBA notifications, or court orders can alter thresholds, add corridors, or remove exemptions. Keeping `bbmp_rules.py` isolated means rule updates never touch the CV pipeline, and the compliance module can be tested, versioned, and swapped independently. `analyze.py` knows nothing about BBMP specifics; it only calls `apply_bbmp_compliance()` and passes through the results.
